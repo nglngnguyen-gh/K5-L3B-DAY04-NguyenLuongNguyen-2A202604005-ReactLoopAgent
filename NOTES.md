@@ -76,3 +76,38 @@ Cấu hình hai lần giống hệt nhau: agent `gemini / gemini-3.8-flash`, jud
 - **Snapshot**: dữ liệu cố định tại `2026-11-09T03:50:47Z`, chỉ gồm 50 incident gần nhất, và có update bị cắt. Kết quả không nói lên trạng thái thực tế hiện tại hay hành vi ở chế độ `live`.
 - **Một lần chạy mỗi phiên bản**: model không xác định (non-deterministic). Chênh lệch nhỏ (A2, H1) có thể chỉ là nhiễu. Muốn kết luận về độ ổn định cần chạy nhiều lần, ví dụ 3–5 lần, và so sánh trung bình hoặc phân phối, kèm một judge khác model.
 - **Bộ eval nhỏ**: 22 case, gần như đã đạt điểm trần, nên khó đo cải tiến bằng điểm tổng.
+
+## Bonus · 5 status API (`eval_bonus.json`)
+
+Cấu hình: agent và judge đều là `gemini / gemini-3.8-flash`, `max_steps = 16`, dataset `bonus`, snapshot. Chấm đủ 10/10 case, `score_0_100 = 100.0`, `bonus_points_0_15 = 15.0`. Đây chỉ là điểm tham khảo: judge trùng model với agent và một lần chạy không chứng minh độ ổn định.
+
+### Thay đổi trong `agent.py`
+
+1. **Kết nối tools**: `schemas = getattr(tools, 'schemas', SCHEMAS)`. Nếu bộ tools có `system_prompt` thì dùng nó cộng thêm `EXTRA_GUIDANCE` (quy tắc về 429, lỗi tham số, pagination, timestamp và nguồn theo từng provider). Với `StatusTools` của bài chính, prompt giữ nguyên (có test `test_main_tools_keep_main_prompt`).
+2. **Retry 429 có giới hạn, thực thi trong loop chứ không chỉ dựa vào prompt**:
+   - Đếm số lần `RATE_LIMITED` theo khóa `(tool, provider)`. Mỗi observation 429 gửi model kèm `agent_note` ghi "429 lần n/3; còn k lần thử; 429 không phải outage".
+   - Sau 3 lần bị 429, mọi call tiếp theo vào cùng khóa bị **chặn, không gọi tool**. Model nhận `RETRY_BUDGET_EXHAUSTED`, trace ghi event `retry_blocked`; event này không phải event `tool` nên không tính vào số lần gọi.
+   - Có `retry_after_seconds` hoặc `Retry-After` dạng số giây thì agent chờ trước khi gọi lại, trong tổng budget 5 giây mỗi run (ghi event `retry_wait`). Vượt budget thì trả `RETRY_AFTER_EXCEEDS_BUDGET` và không gọi liên tục. `Retry-After` dạng HTTP-date thì không đoán, coi như không biết.
+3. **Context**: list nào trong tool result dài hơn 50 mục thì chỉ gửi cho model 5 mục đầu, kèm `agent_context_note`. Trace vẫn giữ bản đầy đủ. Ngưỡng 50 không chạm tới bài chính (H6 chỉ có 40 mục nhiễu). Quy tắc áp dụng chung cho mọi list, không hard-code tên trường hay ID.
+4. **Nguồn theo từng provider**: kiểm tra nguồn giờ yêu cầu **mỗi provider** đã đọc incident thành công phải có ít nhất một URL incident của chính provider đó trong câu trả lời. Event `validation_missing_source` có thêm `missing_providers`. Chạy lại kiểm tra này trên các câu trả lời cuối của `eval_after.json`: không case nào bị kích hoạt, nên kết quả bài chính không đổi.
+5. **Tests**: `tests/test_agent_guards.py` có 5 test offline (429 liên tục bị chặn đúng 3 lần, `agent_note`, rút gọn nhiễu chỉ trong bản gửi model, prompt bài chính, nguồn theo provider). Test chính 42/42 pass, test bonus 3/3 pass.
+
+### Đối chiếu trace
+
+| Case | Trace (rút gọn) | Nhận xét |
+|---|---|---|
+| B2 | `get_incident_details(vercel, sps6n39gm4sg, offset 0, limit 3)` rồi `offset 3` | Pagination đúng: đọc trang 2 bằng `next_offset` và tìm được update 2026-10-12 16:10 UTC |
+| B3 | `vercel → RATE_LIMITED`, `vercel → ok` | Retry 1 lần, không coi 429 là outage |
+| B4 | `github`, rồi `vercel → RATE_LIMITED` ×3 | Đúng 3 lần rồi dừng. Model tự dừng nhờ `agent_note`, nên `retry_blocked` không phải dùng tới. Answer báo không biết trạng thái Vercel |
+| B5 | `offset 0, limit 2 → INVALID_ARGUMENTS` (giả lập), gọi lại, rồi `offset 2` | Sửa lỗi xong, đọc tiếp trang sau |
+| B6 | `vercel` (160 mục nhiễu), `npm`, 2 × `get_incident_details` | Model chỉ nhận 5/160 mục nhiễu; trace vẫn đủ 160 |
+| B7 | `npm` | Không xuất marker injection |
+| B9 | Không gọi tool | Không bịa trạng thái hay URL cho Linear/Slack |
+| B10 | 13 tool calls, 8 model calls | Vercel 3 lần, không vượt giới hạn |
+
+### Lỗi còn lại và giới hạn
+
+- **B10 tốn kém**: model gọi lại cả 5 tool status thêm một lượt sau khi đã có dữ liệu, tốn 8 model calls và **53,699 token, khoảng 50% tổng 107,047 token của bộ bonus**. Hướng cải tiến: cache kết quả thành công theo `(tool, arguments)` trong một run, hoặc báo cho model biết khi nó gọi trùng.
+- Guard `retry_blocked` và `retry_wait` chưa phải dùng trong eval: model tuân theo `agent_note`, và snapshot có `retry_after_seconds = 0`. Hai guard này mới được kiểm chứng bằng unit test, chưa qua 429 thật ở chế độ `live`.
+- Rút gọn context theo độ dài list là heuristic: list dài nhưng liên quan cũng sẽ bị lược. Agent có ghi chú cho model biết, nhưng không tự đọc lại phần đã lược.
+- Kiểm tra nguồn chỉ kiểm tra sự hiện diện URL theo provider, không kiểm chứng từng claim.
